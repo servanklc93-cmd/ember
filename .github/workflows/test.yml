@@ -19,18 +19,21 @@ jobs:
       - run: pip install -e ".[dev]"
       - run: pytest -v
 
-  redis-cli:
-    # make sure the real redis client tools can talk to us
+  compat:
+    # make sure real redis clients (redis-cli, redis-benchmark, redis-py) can talk to us
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: sudo apt-get update && sudo apt-get install -y redis-tools
+      - run: |
+          sudo apt-get update && sudo apt-get install -y redis-tools
+          pip install redis
       - run: |
           python -m ember --port 6390 &
           sleep 1
           redis-cli -p 6390 SET hello world
           test "$(redis-cli -p 6390 GET hello)" = "world"
           redis-benchmark -p 6390 -n 20000 -c 20 -t set,get,lpush,lpop -q
+          python tests/compat_redis_py.py 6390

@@ -6,8 +6,8 @@
 
 A Redis-compatible in-memory database written in pure Python, with no dependencies.
 
-It speaks the real Redis wire protocol (RESP2), so `redis-cli`, `redis-benchmark`
-and any Redis client library can talk to it.
+It speaks the real Redis wire protocol (RESP2 and RESP3), so `redis-cli`, `redis-benchmark`
+and regular client libraries like `redis-py` work against it unchanged.
 
 ```
 $ python -m ember --aof data.aof
@@ -22,7 +22,7 @@ OK
 
 ## Features
 
-- **RESP2 protocol**: incremental parser that handles partial reads, pipelining and inline commands
+- **RESP2 + RESP3**: incremental parser that handles partial reads, pipelining and inline commands. `HELLO 3` switches a connection to RESP3, where hashes come back as maps, sets as sets, and pub/sub messages as push frames
 - **55 commands** across strings, lists, hashes and sets, plus key expiry
 - **Expiry** works like Redis: lazy on access, plus a background sampler that removes keys nobody reads
 - **Transactions** with `MULTI` / `EXEC` / `DISCARD` and optimistic locking via `WATCH`
@@ -67,6 +67,13 @@ the same probabilistic algorithm Redis uses.
 version number. `WATCH` remembers the versions, and `EXEC` compares them. If any changed,
 the transaction returns a null reply and nothing runs. `FLUSHDB` bumps a global counter,
 so it invalidates every watch.
+
+**RESP3.** Handlers return plain Python values, plus a few marker types (`Map`,
+`SetReply`, `Push`) for shapes RESP3 can express. Each connection remembers which
+protocol it negotiated, and the encoder chooses the wire format per connection, so
+`HGETALL` is a flat array for a RESP2 client and a real map for a RESP3 one. That
+mattered in practice: `redis-py` 8 sends `HELLO 3` on connect and refuses to continue
+if the server can't speak RESP3.
 
 **AOF.** After a write command runs, the server checks whether `db.dirty` changed. Only
 commands that actually modified something get logged, so a `SET ... NX` that did nothing
@@ -129,12 +136,12 @@ pytest
 | expiry | `EXPIRE` `PEXPIRE` `EXPIREAT` `PEXPIREAT` `TTL` `PTTL` `PERSIST` |
 | transactions | `MULTI` `EXEC` `DISCARD` `WATCH` `UNWATCH` |
 | pub/sub | `SUBSCRIBE` `UNSUBSCRIBE` `PSUBSCRIBE` `PUNSUBSCRIBE` `PUBLISH` |
-| server | `PING` `ECHO` `INFO` `SELECT 0` `BGREWRITEAOF` `QUIT` `RESET` |
+| server | `HELLO` `PING` `ECHO` `INFO` `SELECT 0` `BGREWRITEAOF` `QUIT` `RESET` |
 
 ## Not implemented (yet)
 
 - sorted sets, streams, `SCAN`, blocking list ops (`BLPOP`)
-- RESP3, ACLs, replication, cluster mode
+- ACLs / `AUTH`, replication, cluster mode
 - `BGREWRITEAOF` blocks the loop. Redis forks a child for this; doing the same here would
   mean buffering writes that arrive during the rewrite and replaying them onto the new file.
 
