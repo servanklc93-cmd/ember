@@ -1,0 +1,20 @@
+[project]
+name = "ember"
+version = "0.1.0"
+description = "A Redis-compatible in-memory database written in pure Python"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+ember = "ember.__main__:main"
+
+[tool.setuptools]
+packages = ["ember"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
