@@ -209,20 +209,27 @@ def test_watch_abort_is_null_in_resp3(server):
 
 
 def test_aof_rewrites_itself_when_it_doubles(tmp_path, monkeypatch):
+    import time
+
     import ember.aof
     monkeypatch.setattr(ember.aof, "REWRITE_MIN_SIZE", 10_000)
     path = tmp_path / "data.aof"
 
     srv = RunningServer(str(path)).start()
     c = srv.connect()
-    for i in range(200):
-        c("SET", "key", "x" * 500)  # same key over and over, mostly garbage in the log
-    # the cron runs every 100ms
-    import time
-    for _ in range(30):
-        if path.stat().st_size < 5_000:
-            break
-        time.sleep(0.1)
-    assert path.stat().st_size < 5_000
+    for _ in range(200):
+        c("SET", "key", "x" * 500)  # ~106KB of log for one live key
+
+    # the cron (every 100ms) rewrites whenever the file passes 2x the base
+    # size, so however the writes and ticks interleave, the file ends up
+    # below that threshold instead of holding all 200 commands
+    deadline = time.monotonic() + 3
+    while path.stat().st_size > 2 * 10_000 and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert path.stat().st_size <= 2 * 10_000
     assert c("GET", "key") == b"x" * 500
+    srv.stop()
+
+    srv = RunningServer(str(path)).start()
+    assert srv.connect()("GET", "key") == b"x" * 500
     srv.stop()
