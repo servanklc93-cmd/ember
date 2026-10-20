@@ -1,4 +1,4 @@
-from ember.protocol import encode_command
+from ember.protocol import Map, Push, SetReply, encode_command
 
 from tests.conftest import RunningServer
 
@@ -165,3 +165,64 @@ def test_truncated_aof_is_repaired(tmp_path):
     assert c("GET", "b") is None
     srv.stop()
     assert path.read_bytes() == good
+
+
+def test_hello_switches_to_resp3(conn):
+    info = conn("HELLO", "3")
+    assert isinstance(info, Map)
+    fields = dict(zip(info[::2], info[1::2]))
+    assert fields[b"proto"] == 3 and fields[b"server"] == b"ember"
+
+    conn("HSET", "h", "f", "v")
+    assert isinstance(conn("HGETALL", "h"), Map)
+    conn("SADD", "s", "m")
+    assert isinstance(conn("SMEMBERS", "s"), SetReply)
+    conn.sock.sendall(encode_command(["GET", "missing"]))
+    assert conn.sock.recv(16) == b"_\r\n"
+
+
+def test_hello_rejects_unknown_version(conn):
+    assert conn("HELLO", "4").startswith("NOPROTO")
+    assert conn("HELLO")[5] == 2  # still on RESP2
+
+
+def test_resp3_pubsub_uses_push_and_allows_commands(server):
+    sub, pub = server.connect(), server.connect()
+    sub("HELLO", "3")
+    assert isinstance(sub("SUBSCRIBE", "news"), Push)
+    # in RESP3 a subscribed connection can still run normal commands
+    assert sub("SET", "k", "v") == "OK"
+    pub("PUBLISH", "news", "hi")
+    msg = sub.read()
+    assert isinstance(msg, Push) and msg == [b"message", b"news", b"hi"]
+
+
+def test_watch_abort_is_null_in_resp3(server):
+    a, b = server.connect(), server.connect()
+    a("HELLO", "3")
+    a("WATCH", "k")
+    b("SET", "k", "1")
+    a("MULTI")
+    a("SET", "k", "2")
+    a.sock.sendall(encode_command(["EXEC"]))
+    assert a.sock.recv(16) == b"_\r\n"
+
+
+def test_aof_rewrites_itself_when_it_doubles(tmp_path, monkeypatch):
+    import ember.aof
+    monkeypatch.setattr(ember.aof, "REWRITE_MIN_SIZE", 10_000)
+    path = tmp_path / "data.aof"
+
+    srv = RunningServer(str(path)).start()
+    c = srv.connect()
+    for i in range(200):
+        c("SET", "key", "x" * 500)  # same key over and over, mostly garbage in the log
+    # the cron runs every 100ms
+    import time
+    for _ in range(30):
+        if path.stat().st_size < 5_000:
+            break
+        time.sleep(0.1)
+    assert path.stat().st_size < 5_000
+    assert c("GET", "key") == b"x" * 500
+    srv.stop()
