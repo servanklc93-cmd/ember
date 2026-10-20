@@ -6,6 +6,8 @@
 
 A Redis-compatible in-memory database written in pure Python, with no dependencies.
 
+![demo: redis-cli talking to ember, then a kill -9 and recovery from the AOF](docs/demo.gif)
+
 It speaks the real Redis wire protocol (RESP2 and RESP3), so `redis-cli`, `redis-benchmark`
 and regular client libraries like `redis-py` work against it unchanged.
 
