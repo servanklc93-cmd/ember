@@ -9,14 +9,15 @@ from . import __version__
 from .commands import COMMANDS
 from .db import CommandError, Database
 from .protocol import (
-    INCOMPLETE, OK, PONG, QUEUED, ErrorReply, ProtocolError, SimpleString,
-    encode, parse,
+    INCOMPLETE, NULL_ARRAY, OK, PONG, QUEUED, ErrorReply, Map, ProtocolError, Push,
+    SimpleString, encode, parse,
 )
 
 log = logging.getLogger("ember")
 
 # commands a client may still send while subscribed
 PUBSUB_ALLOWED = {"SUBSCRIBE", "UNSUBSCRIBE", "PSUBSCRIBE", "PUNSUBSCRIBE", "PING", "QUIT", "RESET"}
+# RESP3 multiplexes push messages with normal replies, so anything goes there
 
 
 class Client:
@@ -31,6 +32,11 @@ class Client:
         self.queue_failed = False
         self.watched = {}
         self.closing = False
+        self.proto = 2
+        self.id = server.next_client_id()
+
+    def encode(self, value):
+        return encode(value, self.proto)
 
     @property
     def subscribed(self):
@@ -61,7 +67,7 @@ class Client:
                     self.writer.write(b"".join(out))
                     await self.writer.drain()
         except ProtocolError as e:
-            self.writer.write(encode(ErrorReply(f"ERR Protocol error: {e}")))
+            self.writer.write(self.encode(ErrorReply(f"ERR Protocol error: {e}")))
         except (ConnectionResetError, BrokenPipeError):
             pass
         finally:
@@ -74,36 +80,36 @@ class Client:
         try:
             name = argv[0].decode().upper()
         except (UnicodeDecodeError, AttributeError):
-            return encode(ErrorReply("ERR unknown command"))
+            return self.encode(ErrorReply("ERR unknown command"))
         args = argv[1:]
 
-        if self.subscribed and name not in PUBSUB_ALLOWED:
-            return encode(ErrorReply(
+        if self.subscribed and self.proto == 2 and name not in PUBSUB_ALLOWED:
+            return self.encode(ErrorReply(
                 f"ERR Can't execute '{name.lower()}': only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context"))
 
         special = getattr(self, "cmd_" + name.lower(), None)
         if special is not None and name in CLIENT_COMMANDS:
             if self.queue is not None and name not in ("EXEC", "DISCARD", "MULTI", "WATCH"):
                 self.queue.append(argv)
-                return encode(QUEUED)
+                return self.encode(QUEUED)
             try:
                 return special(args)
             except CommandError as e:
-                return encode(ErrorReply(str(e)))
+                return self.encode(ErrorReply(str(e)))
 
         cmd = COMMANDS.get(name)
         if cmd is None:
             self._fail_transaction()
-            return encode(ErrorReply(f"ERR unknown command '{argv[0].decode(errors='replace')}'"))
+            return self.encode(ErrorReply(f"ERR unknown command '{argv[0].decode(errors='replace')}'"))
         if not cmd.check_arity(len(argv)):
             self._fail_transaction()
-            return encode(ErrorReply(f"ERR wrong number of arguments for '{name.lower()}' command"))
+            return self.encode(ErrorReply(f"ERR wrong number of arguments for '{name.lower()}' command"))
 
         if self.queue is not None:
             self.queue.append(argv)
-            return encode(QUEUED)
+            return self.encode(QUEUED)
 
-        return encode(self.server.call(cmd, args))
+        return self.encode(self.server.call(cmd, args))
 
     def _fail_transaction(self):
         if self.queue is not None:
@@ -113,37 +119,57 @@ class Client:
 
     def cmd_quit(self, args):
         self.closing = True
-        return encode(OK)
+        return self.encode(OK)
+
+    def cmd_hello(self, args):
+        if args:
+            try:
+                proto = int(args[0])
+            except ValueError:
+                raise CommandError("Protocol version is not an integer or out of range") from None
+            if proto not in (2, 3):
+                raise CommandError("NOPROTO unsupported protocol version")
+            self.proto = proto
+        # AUTH and SETNAME options are accepted and ignored, there are no users
+        return self.encode(Map([
+            b"server", b"ember",
+            b"version", __version__.encode(),
+            b"proto", self.proto,
+            b"id", self.id,
+            b"mode", b"standalone",
+            b"role", b"master",
+            b"modules", [],
+        ]))
 
     def cmd_ping(self, args):
-        if self.subscribed:
-            return encode([b"pong", args[0] if args else b""])
-        return encode(args[0] if args else PONG)
+        if self.subscribed and self.proto == 2:
+            return self.encode([b"pong", args[0] if args else b""])
+        return self.encode(args[0] if args else PONG)
 
     def cmd_select(self, args):
         if args != [b"0"]:
             raise CommandError("ember only has database 0")
-        return encode(OK)
+        return self.encode(OK)
 
     def cmd_reset(self, args):
         self.server.unsubscribe_all(self)
         self.queue = None
         self.watched.clear()
-        return encode(SimpleString("RESET"))
+        return self.encode(SimpleString("RESET"))
 
     def cmd_multi(self, args):
         if self.queue is not None:
             raise CommandError("MULTI calls can not be nested")
         self.queue = []
         self.queue_failed = False
-        return encode(OK)
+        return self.encode(OK)
 
     def cmd_discard(self, args):
         if self.queue is None:
             raise CommandError("DISCARD without MULTI")
         self.queue = None
         self.watched.clear()
-        return encode(OK)
+        return self.encode(OK)
 
     def cmd_watch(self, args):
         if self.queue is not None:
@@ -151,11 +177,11 @@ class Client:
         db = self.server.db
         for key in args:
             self.watched.setdefault(key, (db.version(key), db.flushes))
-        return encode(OK)
+        return self.encode(OK)
 
     def cmd_unwatch(self, args):
         self.watched.clear()
-        return encode(OK)
+        return self.encode(OK)
 
     def cmd_exec(self, args):
         if self.queue is None:
@@ -164,14 +190,14 @@ class Client:
         watched, self.watched = self.watched, {}
 
         if self.queue_failed:
-            return encode(ErrorReply("EXECABORT Transaction discarded because of previous errors."))
+            return self.encode(ErrorReply("EXECABORT Transaction discarded because of previous errors."))
 
         db = self.server.db
         for key, (version, flushes) in watched.items():
             # reading the key first lets a lazily expired key count as modified
             db.get(key)
             if db.version(key) != version or db.flushes != flushes:
-                return b"*-1\r\n"
+                return self.encode(NULL_ARRAY)
 
         # nothing awaits in here, so no other client can run in between
         replies = [self.execute(argv) for argv in queue]
@@ -196,13 +222,13 @@ class Client:
         for name in names:
             mine.add(name)
             registry.setdefault(name, set()).add(self)
-            out.append(encode([kind, name, len(self.channels) + len(self.patterns)]))
+            out.append(self.encode(Push([kind, name, len(self.channels) + len(self.patterns)])))
         return b"".join(out)
 
     def _unsubscribe(self, names, mine, registry, kind):
         names = names or sorted(mine)
         if not names:
-            return encode([kind, None, 0])
+            return self.encode(Push([kind, None, 0]))
         out = []
         for name in names:
             mine.discard(name)
@@ -211,39 +237,39 @@ class Client:
                 subs.discard(self)
                 if not subs:
                     del registry[name]
-            out.append(encode([kind, name, len(self.channels) + len(self.patterns)]))
+            out.append(self.encode(Push([kind, name, len(self.channels) + len(self.patterns)])))
         return b"".join(out)
 
     def cmd_publish(self, args):
         if len(args) != 2:
             raise CommandError("wrong number of arguments for 'publish' command")
-        return encode(self.server.publish(*args))
+        return self.encode(self.server.publish(*args))
 
     def cmd_info(self, args):
-        return encode(self.server.info())
+        return self.encode(self.server.info())
 
     def cmd_config(self, args):
         # redis-cli and redis-benchmark poke at CONFIG on startup; keep them happy
         if args and args[0].upper() == b"GET":
-            return encode([])
-        return encode(OK)
+            return self.encode(Map())
+        return self.encode(OK)
 
     def cmd_command(self, args):
-        return encode([])
+        return self.encode([])
 
     def cmd_client(self, args):
-        return encode(OK)
+        return self.encode(OK)
 
     def cmd_bgrewriteaof(self, args):
         if self.server.aof is None:
             raise CommandError("AOF is not enabled")
         self.server.aof.rewrite(self.server.db)
-        return encode(SimpleString("Background append only file rewriting started"))
+        return self.encode(SimpleString("Background append only file rewriting started"))
 
 
 CLIENT_COMMANDS = {
     "QUIT", "PING", "SELECT", "RESET", "MULTI", "DISCARD", "WATCH", "UNWATCH",
-    "EXEC", "SUBSCRIBE", "PSUBSCRIBE", "UNSUBSCRIBE", "PUNSUBSCRIBE", "PUBLISH",
+    "EXEC", "HELLO", "SUBSCRIBE", "PSUBSCRIBE", "UNSUBSCRIBE", "PUNSUBSCRIBE", "PUBLISH",
     "INFO", "CONFIG", "COMMAND", "CLIENT", "BGREWRITEAOF",
 }
 
@@ -261,6 +287,11 @@ class Server:
         self.commands_processed = 0
         self._server = None
         self._tasks = []
+        self._last_id = 0
+
+    def next_client_id(self):
+        self._last_id += 1
+        return self._last_id
 
     def call(self, cmd, args):
         self.commands_processed += 1
@@ -276,13 +307,13 @@ class Server:
     def publish(self, channel, message):
         receivers = 0
         for client in self.channels.get(channel, ()):
-            client.writer.write(encode([b"message", channel, message]))
+            client.writer.write(client.encode(Push([b"message", channel, message])))
             receivers += 1
         text = channel.decode("latin-1")
         for pattern, clients in self.patterns.items():
             if fnmatchcase(text, pattern.decode("latin-1")):
                 for client in clients:
-                    client.writer.write(encode([b"pmessage", pattern, channel, message]))
+                    client.writer.write(client.encode(Push([b"pmessage", pattern, channel, message])))
                     receivers += 1
         return receivers
 

@@ -12,7 +12,7 @@ from itertools import islice
 from typing import Callable
 
 from .db import CommandError
-from .protocol import OK, PONG, SimpleString
+from .protocol import OK, PONG, Map, SetReply, SimpleString
 
 
 @dataclass
@@ -423,7 +423,7 @@ def hdel(db, args):
 @command("HGETALL", 2)
 def hgetall(db, args):
     h = db.get(args[0], dict) or {}
-    return [x for pair in h.items() for x in pair]
+    return Map(x for pair in h.items() for x in pair)
 
 
 @command("HKEYS", 2)
@@ -485,7 +485,7 @@ def srem(db, args):
 
 @command("SMEMBERS", 2)
 def smembers(db, args):
-    return sorted(db.get(args[0], set) or ())
+    return SetReply(sorted(db.get(args[0], set) or ()))
 
 
 @command("SISMEMBER", 3)
@@ -504,15 +504,15 @@ def _sets(db, keys):
 
 @command("SINTER", -2)
 def sinter(db, args):
-    return sorted(set.intersection(*_sets(db, args)))
+    return SetReply(sorted(set.intersection(*_sets(db, args))))
 
 
 @command("SUNION", -2)
 def sunion(db, args):
-    return sorted(set.union(*_sets(db, args)))
+    return SetReply(sorted(set.union(*_sets(db, args))))
 
 
 @command("SDIFF", -2)
 def sdiff(db, args):
     first, *rest = _sets(db, args)
-    return sorted(first.difference(*rest))
+    return SetReply(sorted(first.difference(*rest)))
