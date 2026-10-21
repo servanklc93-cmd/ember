@@ -126,6 +126,13 @@ pip install -e ".[dev]"
 pytest
 ```
 
+## Security
+
+ember has no authentication (`AUTH`) and no TLS. By default it only listens on
+`127.0.0.1`, so nothing outside your machine can reach it. Don't run it with
+`--host 0.0.0.0` on a network you don't trust. It's the same rule as a Redis
+server without `requirepass`. Bulk strings are capped at 512 MB, like Redis.
+
 ## Commands
 
 | group | commands |
